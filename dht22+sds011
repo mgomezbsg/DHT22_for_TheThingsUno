@@ -1,0 +1,231 @@
+//Codi DHT22 i SDS011
+
+#include <SDS011.h>
+#include <TheThingsNetwork.h>
+#include <DHT.h>
+#include <DHT_U.h>
+
+const char *appEui = "70B3D57ED001F00B";
+const char *appKey = "2CD67A776DD82FD691B248AF480BC60A";
+
+#define PIN_RX 8
+#define PIN_TX 9
+
+#define SLEEP_ON 1
+#define SLEEP_TIME  5
+#define FAN_SPINUP 30
+#define PWR_DOWN 0
+
+#define DEBUGRATE 9600
+#define LORA_RATE 57600
+
+#define loraSerial Serial1
+#define debugSerial Serial
+
+
+// Power saving
+#include "sleep_32u4.h"
+
+// sleep time between fan spinup and sleep in minutes.
+volatile uint16_t iWakeCntr = 0;
+
+// WDT ISR
+ISR(WDT_vect)
+{
+  if (iWakeCntr > UINT16_MAX-1)
+    {
+    iWakeCntr = 0;
+    }
+    else
+    {
+        iWakeCntr++;
+    }
+}
+
+DHT dht(2, DHT22);
+
+// TTN settings (no editing needed)
+const ttn_fp_t freqPlan = TTN_FP_EU868;
+TheThingsNetwork ttn(loraSerial, debugSerial, freqPlan);
+
+// SDS011, paticulate matter variables (no editing needed)
+float p10,p25;
+float samples_p10[10];
+float samples_p25[10];
+int error;
+SDS011 my_sds;
+
+
+void setup() {
+
+    debugSerial.begin(DEBUGRATE);
+    loraSerial.begin(LORA_RATE);
+
+    while (!debugSerial && millis() < 10000);
+
+    // fine dust
+    debugSerial.println("Started!");
+    debugSerial.println("-- STATUS");
+  my_sds.begin(PIN_RX, PIN_TX);
+
+
+  #if PWR_DOWN
+  // for debugging
+  pinMode(13, OUTPUT);
+  setupPowerMode();
+  #endif
+
+    ttn.showStatus();
+    ttn.join(appEui, appKey); // OTAA
+
+    dht.begin();
+
+}
+
+void loop() {
+
+ digitalWrite(13, HIGH);
+
+ #if SLEEP_ON
+    debugSerial.println("Waking up SDS...");
+    my_sds.wakeup();
+
+    // let the fan run for a minute to clean the fan
+    debugSerial.println("Letting fan speed up and clean itself for a minute...");
+    long delay1 = 1000L * FAN_SPINUP;
+    delay(delay1);
+    #endif
+
+ debugSerial.println("-- LOOP");
+uint16_t humidity = dht.readHumidity(false) * 100;
+uint16_t temperature = dht.readTemperature(false) * 100;
+
+    //SDS011
+
+     debugSerial.println("Reading 10 samples of sensor data (some may fail)...");
+
+    // read pm25 and pm10 values from the sensor
+    long delay2 = 1100;
+    long samples = 10;
+
+    for (int i = 0; i < samples; i++)
+    {
+        error = my_sds.read(&p25, &p10);
+        if (!error)
+        {
+            samples_p25[i] = p25;
+            samples_p10[i] = p10;
+
+            debugSerial.println("P2.5: " + String(p25));
+            debugSerial.println("P10:  " + String(p10));
+        }
+        else
+        {
+            debugSerial.println("error reading data!");
+        }
+
+        delay(delay2);
+    }
+
+    float p25median = median(samples_p25, 10);
+    float p10median = median(samples_p10, 10);
+
+    // Encode float as int (20.98 becomes 2098)
+    int16_t p10int = round(p10median * 100);
+    int16_t p25int = round(p25median * 100);
+
+    debugSerial.println("P2.5 median: " + String(p25median));
+    debugSerial.println("P10  median: " + String(p10median));
+
+      byte payload[8];
+
+       // sds011
+    payload[0] = highByte(p10int);
+    payload[1] = lowByte(p10int);
+    payload[2] = highByte(p25int);
+    payload[3] = lowByte(p25int);
+
+
+      //weather sensor
+
+  payload[0] = highByte(temperature);
+  payload[1] = lowByte(temperature);
+  payload[2] = highByte(humidity);
+  payload[3] = lowByte(humidity);
+
+  debugSerial.print("Temperature: ");
+  debugSerial.println(temperature);
+  debugSerial.print("Humidity: ");
+  debugSerial.println(humidity);
+
+
+
+
+
+    // send via TTN
+    debugSerial.println("Sending data to TTN...");
+    ttn.sendBytes(payload, sizeof(payload));
+
+    #if SLEEP_ON
+    // put sensor to sleep so save battery
+    debugSerial.println("Sending SDS to sleep...");
+    my_sds.sleep();
+
+    // sleep for a few minutes to save energy
+    #if PWR_DOWN
+  //delay(5000);
+  enterSleepFor(SLEEP_TIME);
+  #else
+  delay((1000L * 60 * SLEEP_TIME) - (delay1 + samples * delay2)); // substract wakup time to prevent heavy drift
+    #endif
+
+    #endif
+
+}
+
+
+// calculate the median
+float median(float samples[], int m)
+ {
+    float sorted[m];
+
+    for(int i = 0; i < m; i++)
+    {
+        sorted[i] = samples[i];
+    }
+
+    bubbleSort(sorted, m);
+
+    if (bitRead(m, 0) == 1)
+    {
+        return sorted[m / 2];
+    }
+    else
+    {
+        return (sorted[(m / 2) - 1] + sorted[m / 2]) / 2;
+    }
+}
+
+// sort array with bubble sort (needed for the median)
+void bubbleSort(float A[], int len) {
+    unsigned long newn;
+    unsigned long n = len;
+    float temp = 0.0;
+
+    do {
+        newn = 1;
+
+        for(int p = 1; p < len; p++)
+        {
+            if (A[p-1] > A[p])
+            {
+                temp = A[p];
+                A[p] = A[p-1];
+                A[p-1] = temp;
+                newn = p;
+            }
+        }
+
+        n = newn;
+    } while (n > 1);
+}
